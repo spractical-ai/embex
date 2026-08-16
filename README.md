@@ -1,2 +1,2 @@
-# embex
+# EmbeX
 Embedding Models with Jax
