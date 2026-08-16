@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "embex"
+version = "0.1.0"
+description = "JAX and Flax NNX building blocks for embedding-model training."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { file = "LICENSE" }
+authors = [{ name = "spractical-ai" }]
+keywords = ["embeddings", "flax", "jax", "nnx", "training"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "jax==0.9.2",
+  "flax==0.12.6",
+  "optax>=0.2.8",
+  "numpy>=1.26",
+  "huggingface_hub>=0.30",
+  "safetensors>=0.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/spractical-ai/embex"
+Repository = "https://github.com/spractical-ai/embex.git"
+Issues = "https://github.com/spractical-ai/embex/issues"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+cuda12 = ["jax[cuda12]==0.9.2"]
+cuda13 = ["jax[cuda13]==0.9.2"]
+tpu = ["jax[tpu]==0.9.2"]
+
+[tool.uv]
+default-groups = ["dev"]
+conflicts = [
+  [
+    { group = "cuda12" },
+    { group = "cuda13" },
+  ],
+  [
+    { group = "cuda12" },
+    { group = "tpu" },
+  ],
+  [
+    { group = "cuda13" },
+    { group = "tpu" },
+  ],
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/embex"]
