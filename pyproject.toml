@@ -22,6 +22,7 @@ dependencies = [
   "numpy>=1.26",
   "huggingface_hub>=0.30",
   "safetensors>=0.5",
+  "transformers>=4.50",
 ]
 
 [project.urls]

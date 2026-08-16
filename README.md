@@ -35,6 +35,30 @@ committed `uv.lock` for reproducible installs. EmbeX requires Python 3.12 and
 pins JAX 0.9.2 and Flax 0.12.6. Select the accelerator-specific sync command
 below before running training.
 
+## Installation on Kaggle
+
+`uv sync` creates a separate `.venv`, while a Kaggle notebook continues to use
+its already-running kernel Python. Install EmbeX into that exact interpreter so
+plain notebook cells can use `import embex`:
+
+```python
+!git clone https://github.com/spractical-ai/embex.git
+%cd embex
+
+import sys
+!uv pip install --python {sys.executable} --reinstall -e .
+!{sys.executable} -c "import embex; print(embex.__file__)"
+```
+
+The final command should print a path ending in
+`embex/src/embex/__init__.py`. Restart the Kaggle session before importing from
+EmbeX in normal Python cells; Python reads editable-install paths when the
+kernel starts. This CPU command uses the default JAX dependency. For a GPU or
+TPU notebook, use the corresponding accelerator command below instead.
+
+For a terminal or script, keep the isolated environment and prefix commands
+with `uv run`, for example `uv run python train.py`.
+
 ## Accelerator installation
 
 The EmbeX code is accelerator-agnostic: it discovers JAX devices at runtime and
@@ -64,40 +88,114 @@ For development dependencies:
 uv sync --group dev
 ```
 
-## Minimal Qwen3 training setup
+## Inference tutorial
+
+EmbeX expects Hugging Face tokenizer outputs and **always passes an attention
+mask with input IDs**. Use the exact same tokenization behavior for inference
+and training; omitting the mask changes padding and pooling behavior.
 
 ```python
-import jax
-import optax
+from huggingface_hub import hf_hub_download
+from transformers import AutoTokenizer
 
 from embex.models.qwen3_embedding import (
     Qwen3EmbeddingConfig,
     create_qwen3_embedding,
     load_qwen3_embedding_weights,
 )
-from embex.training import contrastive_train_step, create_optimizer
 from embex.utils.distributed import shard_batch
 
 config = Qwen3EmbeddingConfig.from_preset("0.6B")
 model, mesh = create_qwen3_embedding(config)
-load_qwen3_embedding_weights(model, "model.safetensors")
+
+weights_path = hf_hub_download(
+    repo_id="Qwen/Qwen3-Embedding-0.6B", filename="model.safetensors"
+)
+load_qwen3_embedding_weights(model, weights_path)
+
+tokenizer = AutoTokenizer.from_pretrained(
+    "Qwen/Qwen3-Embedding-0.6B", padding_side="left"
+)
+texts = [
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:capital of China",
+    "The capital of China is Beijing.",
+]
+tokens = tokenizer(
+    texts,
+    padding="max_length",
+    truncation=True,
+    max_length=512,
+    return_tensors="np",
+)
+
+# Both values come from the Hugging Face tokenizer and are passed to the model.
+embeddings = model(
+    shard_batch(tokens["input_ids"], mesh),
+    shard_batch(tokens["attention_mask"], mesh),
+)
+print(embeddings.shape)  # (2, 1024) for the 0.6B preset
+```
+
+## Training tutorial
+
+This example uses dummy text pairs and a tiny Qwen-shaped configuration so it
+is safe to run on CPU. It demonstrates the high-level trainer API; it is not a
+useful retrieval model. Train a pretrained 0.6B model by using
+`Qwen3EmbeddingConfig.from_preset("0.6B")`, loading its weights as in the
+inference tutorial, and supplying real aligned query/document pairs.
+
+```python
+import jax.numpy as jnp
+import optax
+from transformers import AutoTokenizer
+
+from embex.models.qwen3_embedding import Qwen3EmbeddingConfig, create_qwen3_embedding
+from embex.trainer import ContrastiveBatch, EmbeddingTrainer
+from embex.training import create_optimizer
+
+tokenizer = AutoTokenizer.from_pretrained(
+    "Qwen/Qwen3-Embedding-0.6B", padding_side="left"
+)
+
+# Small architecture for a quick CPU demonstration; it starts from random weights.
+config = Qwen3EmbeddingConfig(
+    vocab_size=len(tokenizer),
+    hidden_size=64,
+    head_dim=16,
+    intermediate_size=128,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    dtype=jnp.float32,
+)
+model, mesh = create_qwen3_embedding(config)
 
 schedule = optax.warmup_cosine_decay_schedule(
-    init_value=0.0,
-    peak_value=2e-5,
-    warmup_steps=200,
-    decay_steps=2_000,
-    end_value=0.0,
+    init_value=0.0, peak_value=2e-4, warmup_steps=1, decay_steps=3, end_value=0.0
 )
-optimizer = create_optimizer(model, schedule)
+trainer = EmbeddingTrainer(model, create_optimizer(model, schedule), mesh=mesh)
 
-# Tokenize a paired query/context batch outside the library.
-queries = shard_batch(query_input_ids, mesh)
-keys = shard_batch(context_input_ids, mesh)
-query_masks = shard_batch(query_attention_mask, mesh)
-key_masks = shard_batch(context_attention_mask, mesh)
-loss = contrastive_train_step(model, optimizer, queries, keys, query_masks, key_masks)
+batch = ContrastiveBatch.from_tokenizer(
+    tokenizer,
+    queries=[
+        "Instruct: retrieve a relevant passage\nQuery:capital of China",
+        "Instruct: retrieve a relevant passage\nQuery:what causes gravity",
+    ],
+    keys=[
+        "Beijing is the capital of China.",
+        "Gravity attracts bodies with mass.",
+    ],
+    max_length=32,
+)
+
+for step in range(3):
+    print(f"step={step + 1}, loss={trainer.train_batch(batch):.4f}")
 ```
+
+`ContrastiveBatch.from_tokenizer` requires a Hugging Face tokenizer and retains
+both attention masks. `EmbeddingTrainer` places every input and mask on the
+selected mesh, then calls the model with `(input_ids, attention_mask)` for both
+the query and positive-document encoder passes.
 
 `create_qwen3_embedding` uses standard NNX initializers on one device. With
 multiple JAX devices it creates a one-axis FSDP mesh and applies the notebook's
