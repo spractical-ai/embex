@@ -1,8 +1,8 @@
 # EmbeX
 
 EmbeX is a small JAX and Flax NNX library for training embedding models. It
-currently implements Qwen3-Embedding and one-directional InfoNCE, preserving
-the model and training behavior from the original notebook while moving reusable
+supports Qwen3-Embedding and XLM-RoBERTa encoders together with one-directional
+InfoNCE, preserving the original Qwen notebook's behavior while moving reusable
 pieces into a package.
 
 ## Install
@@ -87,6 +87,22 @@ For development dependencies:
 ```bash
 uv sync --group dev
 ```
+
+## Supported models
+
+| Model | Encoder | Sequence pooling | Presets |
+| --- | --- | --- | --- |
+| Qwen3-Embedding | Decoder-only, causal attention | Final non-padding token | 0.6B, 4B, 8B |
+| XLM-RoBERTa | Bidirectional attention with learned positions | Masked mean (default) or first-token (`cls`) pooling | Base, large |
+
+Both implementations expose the `(input_ids, attention_mask) -> embeddings`
+interface used by `EmbeddingTrainer`, support single-device and FSDP model
+creation, and include Hugging Face safetensors import/export adapters.
+XLM-RoBERTa also exposes `encode_tokens` for unpooled contextual states. Its
+weight loader accepts both bare backbone keys and common `roberta.`-prefixed
+masked-language-model checkpoints; unrelated task-head weights are ignored.
+
+The tutorials below intentionally remain focused on Qwen3-Embedding.
 
 ## Inference tutorial
 
@@ -215,4 +231,5 @@ save_model(model, "output/model.safetensors", qwen3_embedding_hf_state_dict)
 
 For a complete Hugging Face-compatible directory, use
 `export_huggingface_model` from `embex.utils.save_model` with the same state-dict
-factory.
+factory. XLM-RoBERTa provides the equivalent `xlm_roberta_hf_state_dict`
+factory in `embex.models.xlm_roberta`.
