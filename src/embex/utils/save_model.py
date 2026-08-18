@@ -22,7 +22,11 @@ def save_model(
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    save_file(dict(state_dict_factory(model)), str(output_path))
+    weights = {
+        name: np.ascontiguousarray(value)
+        for name, value in state_dict_factory(model).items()
+    }
+    save_file(weights, str(output_path))
     return output_path
 
 

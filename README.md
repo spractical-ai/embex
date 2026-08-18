@@ -2,8 +2,8 @@
 
 EmbeX is a small JAX and Flax NNX library for training embedding models. It
 supports Qwen3-Embedding and XLM-RoBERTa encoders together with one-directional
-InfoNCE, preserving the original Qwen notebook's behavior while moving reusable
-pieces into a package.
+InfoNCE and masked language modeling, preserving the original Qwen notebook's
+behavior while moving reusable pieces into a package.
 
 ## Install
 
@@ -90,17 +90,25 @@ uv sync --group dev
 
 ## Supported models
 
-| Model | Encoder | Sequence pooling | Presets |
+| Model | Encoder | Training objectives | Presets |
 | --- | --- | --- | --- |
-| Qwen3-Embedding | Decoder-only, causal attention | Final non-padding token | 0.6B, 4B, 8B |
-| XLM-RoBERTa | Bidirectional attention with learned positions | Masked mean (default) or first-token (`cls`) pooling | Base, large |
+| Qwen3-Embedding | Decoder-only, causal attention with final-token pooling | Contrastive InfoNCE only | 0.6B, 4B, 8B |
+| XLM-RoBERTa | Bidirectional attention with masked-mean or first-token (`cls`) pooling | Contrastive InfoNCE, MLM, or both jointly | Base, large |
 
 Both implementations expose the `(input_ids, attention_mask) -> embeddings`
 interface used by `EmbeddingTrainer`, support single-device and FSDP model
 creation, and include Hugging Face safetensors import/export adapters.
-XLM-RoBERTa also exposes `encode_tokens` for unpooled contextual states. Its
-weight loader accepts both bare backbone keys and common `roberta.`-prefixed
-masked-language-model checkpoints; unrelated task-head weights are ignored.
+XLM-RoBERTa also exposes `encode_tokens` for contextual states and
+`masked_language_model_logits` for token prediction through a decoder tied to
+the input word embeddings. Its weight loader accepts both bare backbone keys
+and common `roberta.`-prefixed checkpoints, loading a compatible `lm_head` when
+one is present while ignoring unrelated task heads.
+
+`masked_language_model_loss` averages token cross-entropy only where labels are
+not `-100`. Use `masked_language_model_train_step` for MLM-only updates or
+`joint_contrastive_mlm_train_step` for a weighted combination of InfoNCE and
+MLM. These MLM APIs require XLM-RoBERTa; Qwen3-Embedding intentionally exposes
+only the contrastive path.
 
 The tutorials below intentionally remain focused on Qwen3-Embedding.
 
@@ -232,4 +240,5 @@ save_model(model, "output/model.safetensors", qwen3_embedding_hf_state_dict)
 For a complete Hugging Face-compatible directory, use
 `export_huggingface_model` from `embex.utils.save_model` with the same state-dict
 factory. XLM-RoBERTa provides the equivalent `xlm_roberta_hf_state_dict`
-factory in `embex.models.xlm_roberta`.
+backbone factory and `xlm_roberta_mlm_hf_state_dict` masked-LM factory in
+`embex.models.xlm_roberta`.

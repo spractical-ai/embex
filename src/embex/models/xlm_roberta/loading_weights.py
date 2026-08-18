@@ -14,6 +14,7 @@ from embex.models.xlm_roberta.modeling import XLMRobertaEmbedding
 
 
 _CHECKPOINT_PREFIXES = ("", "roberta.", "xlm_roberta.", "model.")
+_MLM_CHECKPOINT_PREFIXES = ("", "model.")
 
 
 def _put_like(weights: np.ndarray, variable_state: Any) -> jax.Array:
@@ -71,6 +72,38 @@ def _required_weight_names(num_layers: int) -> list[str]:
     return names
 
 
+def _resolve_optional_mlm_weights(
+    weights: dict[str, np.ndarray],
+) -> dict[str, np.ndarray] | None:
+    names = [
+        "lm_head.dense.weight",
+        "lm_head.dense.bias",
+        "lm_head.layer_norm.weight",
+        "lm_head.layer_norm.bias",
+    ]
+    for prefix in _MLM_CHECKPOINT_PREFIXES:
+        bias_name = next(
+            (
+                name
+                for name in ("lm_head.bias", "lm_head.decoder.bias")
+                if f"{prefix}{name}" in weights
+            ),
+            None,
+        )
+        has_transform = all(f"{prefix}{name}" in weights for name in names)
+        if bias_name is not None and has_transform:
+            resolved = {name: weights[f"{prefix}{name}"] for name in names}
+            resolved["lm_head.bias"] = weights[f"{prefix}{bias_name}"]
+            return resolved
+
+    head_keys = [name for name in weights if "lm_head." in name]
+    if not head_keys:
+        return None
+    raise KeyError(
+        "Checkpoint contains an incomplete or unsupported XLM-RoBERTa MLM head."
+    )
+
+
 def _set_linear(linear: Any, weight: np.ndarray, bias: np.ndarray) -> None:
     linear.kernel = nnx.Param(_put_like(weight.T, linear.kernel))
     linear.bias = nnx.Param(_put_like(bias, linear.bias))
@@ -84,9 +117,10 @@ def _set_layer_norm(layer_norm: Any, weight: np.ndarray, bias: np.ndarray) -> No
 def update_xlm_roberta_weights(
     weights: dict[str, np.ndarray], model: XLMRobertaEmbedding
 ) -> None:
-    """Load a Hugging Face XLM-RoBERTa backbone into an NNX model in place."""
+    """Load an XLM-R backbone and, when present, its MLM head in place."""
     state = nnx.state(model)
     resolved = _resolve_weights(weights, _required_weight_names(len(state.layers)))
+    mlm_weights = _resolve_optional_mlm_weights(weights)
     embeddings = state.embeddings
     embeddings.word_embeddings.embedding = nnx.Param(
         _put_like(
@@ -146,6 +180,20 @@ def update_xlm_roberta_weights(
             resolved[f"{prefix}.output.LayerNorm.weight"],
             resolved[f"{prefix}.output.LayerNorm.bias"],
         )
+    if mlm_weights is not None:
+        _set_linear(
+            state.lm_head.dense,
+            mlm_weights["lm_head.dense.weight"],
+            mlm_weights["lm_head.dense.bias"],
+        )
+        _set_layer_norm(
+            state.lm_head.layer_norm,
+            mlm_weights["lm_head.layer_norm.weight"],
+            mlm_weights["lm_head.layer_norm.bias"],
+        )
+        state.lm_head.bias = nnx.Param(
+            _put_like(mlm_weights["lm_head.bias"], state.lm_head.bias)
+        )
     nnx.update(model, state)
 
 
@@ -172,7 +220,7 @@ def _array(value: Any) -> np.ndarray:
 def _export_linear(
     weights: dict[str, np.ndarray], prefix: str, linear: Any
 ) -> None:
-    weights[f"{prefix}.weight"] = _array(linear.kernel).T
+    weights[f"{prefix}.weight"] = np.ascontiguousarray(_array(linear.kernel).T)
     weights[f"{prefix}.bias"] = _array(linear.bias)
 
 
@@ -223,4 +271,19 @@ def xlm_roberta_hf_state_dict(
         _export_layer_norm(
             weights, f"{prefix}.output.LayerNorm", layer.output_layer_norm
         )
+    return weights
+
+
+def xlm_roberta_mlm_hf_state_dict(
+    model: XLMRobertaEmbedding,
+) -> dict[str, np.ndarray]:
+    """Return a Hugging Face XLM-RoBERTa masked-LM state dictionary."""
+    weights = {
+        f"roberta.{name}": value
+        for name, value in xlm_roberta_hf_state_dict(model).items()
+    }
+    state = nnx.state(model)
+    _export_linear(weights, "lm_head.dense", state.lm_head.dense)
+    _export_layer_norm(weights, "lm_head.layer_norm", state.lm_head.layer_norm)
+    weights["lm_head.bias"] = _array(state.lm_head.bias)
     return weights

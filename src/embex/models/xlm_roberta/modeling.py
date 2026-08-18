@@ -282,8 +282,43 @@ class XLMRobertaBlock(nnx.Module):
         ).astype(attention_output.dtype)
 
 
+class XLMRobertaMLMHead(nnx.Module):
+    """Hugging Face-compatible transform and tied decoder for MLM logits."""
+
+    def __init__(
+        self,
+        config: XLMRobertaConfig,
+        rngs: nnx.Rngs,
+        partition_axis: str | None,
+    ) -> None:
+        self.dense = _linear(
+            config.hidden_size,
+            config.hidden_size,
+            config,
+            rngs,
+            partition_axis,
+            (None, "fsdp"),
+        )
+        self.layer_norm = _layer_norm(config, rngs)
+        self.bias = nnx.Param(jnp.zeros((config.vocab_size,), config.param_dtype))
+
+    def __call__(
+        self, hidden_states: jax.Array, word_embeddings: jax.Array
+    ) -> jax.Array:
+        hidden_states = jax.nn.gelu(
+            self.dense(hidden_states).astype(jnp.float32), approximate=False
+        )
+        hidden_states = self.layer_norm(hidden_states)
+        logits = jnp.einsum(
+            "bsh,vh->bsv",
+            hidden_states.astype(jnp.float32),
+            word_embeddings.astype(jnp.float32),
+        )
+        return logits + self.bias.astype(jnp.float32)
+
+
 class XLMRobertaEmbedding(nnx.Module):
-    """Bidirectional XLM-RoBERTa encoder returning one embedding per sequence."""
+    """XLM-R encoder supporting pooled embeddings and tied-decoder MLM logits."""
 
     def __init__(
         self,
@@ -304,6 +339,7 @@ class XLMRobertaEmbedding(nnx.Module):
             XLMRobertaBlock(config, rngs, partition_axis)
             for _ in range(config.num_hidden_layers)
         )
+        self.lm_head = XLMRobertaMLMHead(config, rngs, partition_axis)
 
     def encode_tokens(
         self,
@@ -333,6 +369,21 @@ class XLMRobertaEmbedding(nnx.Module):
         for layer in self.layers:
             hidden_states = layer(hidden_states, mask, deterministic)
         return hidden_states
+
+    def masked_language_model_logits(
+        self,
+        input_ids: jax.Array,
+        attention_mask: jax.Array | None = None,
+        *,
+        deterministic: bool = True,
+    ) -> jax.Array:
+        """Return per-token vocabulary logits from the tied XLM-R MLM head."""
+        hidden_states = self.encode_tokens(
+            input_ids, attention_mask, deterministic=deterministic
+        )
+        return self.lm_head(
+            hidden_states, self.embeddings.word_embeddings.embedding
+        )
 
     def __call__(
         self,
