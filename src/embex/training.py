@@ -9,7 +9,11 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 
-from embex.utils.loss_functions import infonce_loss, masked_language_model_loss
+from embex.utils.loss_functions import (
+    infonce_kd_loss,
+    infonce_loss,
+    masked_language_model_loss,
+)
 
 
 class EmbeddingModel(Protocol):
@@ -76,6 +80,56 @@ def contrastive_train_step(
     loss, gradients = nnx.value_and_grad(loss_fn)(model)
     optimizer.update(model, gradients)
     return loss
+
+
+@nnx.jit
+def knowledge_distillation_train_step(
+    model: EmbeddingModel,
+    optimizer: nnx.Optimizer,
+    queries: jax.Array,
+    keys: jax.Array,
+    query_masks: jax.Array,
+    key_masks: jax.Array,
+    teacher_q_embeddings: jax.Array,
+    teacher_k_embeddings: jax.Array,
+    temperature: float = 0.05,
+    kd_temperature: float = 0.07,
+    kd_alpha: float = 0.25,
+    false_negative_margin: float = 0.10,
+    teacher_confirmation_margin: float = 0.05,
+    duplicate_similarity_threshold: float = 0.999999,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Run one false-negative-aware InfoNCE and relational-KD update.
+
+    Teacher embeddings are precomputed inputs and are never differentiated.
+    Similarities, normalization, and both loss components are evaluated in
+    float32 even when the encoder emits bfloat16 embeddings.
+    """
+
+    def loss_fn(
+        current_model: EmbeddingModel,
+    ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+        query_embeddings = current_model(queries, query_masks).astype(jnp.float32)
+        key_embeddings = current_model(keys, key_masks).astype(jnp.float32)
+        total_loss, hard_loss, kd_loss = infonce_kd_loss(
+            q_embeddings=query_embeddings,
+            k_embeddings=key_embeddings,
+            teacher_q_embeddings=teacher_q_embeddings,
+            teacher_k_embeddings=teacher_k_embeddings,
+            temperature=temperature,
+            kd_temperature=kd_temperature,
+            kd_alpha=kd_alpha,
+            false_negative_margin=false_negative_margin,
+            teacher_confirmation_margin=teacher_confirmation_margin,
+            duplicate_similarity_threshold=duplicate_similarity_threshold,
+        )
+        return total_loss, (hard_loss, kd_loss)
+
+    (total_loss, component_losses), gradients = nnx.value_and_grad(
+        loss_fn, has_aux=True
+    )(model)
+    optimizer.update(model, gradients)
+    return total_loss, component_losses[0], component_losses[1]
 
 
 @nnx.jit

@@ -1,9 +1,9 @@
 # EmbeX
 
 EmbeX is a small JAX and Flax NNX library for training embedding models. It
-supports Qwen3-Embedding and XLM-RoBERTa encoders together with one-directional
-InfoNCE and masked language modeling, preserving the original Qwen notebook's
-behavior while moving reusable pieces into a package.
+supports Qwen3-Embedding and XLM-RoBERTa encoders together with InfoNCE,
+relational knowledge distillation, and masked language modeling, preserving the
+original Qwen notebook's behavior while moving reusable pieces into a package.
 
 ## Install
 
@@ -92,8 +92,8 @@ uv sync --group dev
 
 | Model | Encoder | Training objectives | Presets |
 | --- | --- | --- | --- |
-| Qwen3-Embedding | Decoder-only, causal attention with final-token pooling | Contrastive InfoNCE only | 0.6B, 4B, 8B |
-| XLM-RoBERTa | Bidirectional attention with masked-mean or first-token (`cls`) pooling | Contrastive InfoNCE, MLM, or both jointly | Base, large |
+| Qwen3-Embedding | Decoder-only, causal attention with final-token pooling | InfoNCE, relational KD | 0.6B, 4B, 8B |
+| XLM-RoBERTa | Bidirectional attention with masked-mean or first-token (`cls`) pooling | InfoNCE, relational KD, MLM, or contrastive + MLM | Base, large |
 
 Both implementations expose the `(input_ids, attention_mask) -> embeddings`
 interface used by `EmbeddingTrainer`, support single-device and FSDP model
@@ -227,6 +227,40 @@ parameter partitioning pattern. Pass a custom `mesh` and `partition_axis` to
 control placement explicitly. The factory always constructs the model inside
 `with jax.set_mesh(mesh):`; direct multi-device construction is rejected unless
 you have entered a mesh context and supplied its partition axis yourself.
+
+## Relational knowledge distillation
+
+Use `knowledge_distillation_train_step` when teacher query and document
+embeddings have already been computed. Teacher and student embedding widths do
+not need to match. Rows must remain aligned across all four batches.
+
+The underlying objective is exposed separately as `infonce_kd_loss`. The
+original `infonce_loss` remains the unchanged, teacher-free contrastive loss.
+
+```python
+from embex.training import knowledge_distillation_train_step
+
+total_loss, hard_loss, kd_loss = knowledge_distillation_train_step(
+    model,
+    optimizer,
+    query_input_ids,
+    key_input_ids,
+    query_attention_mask,
+    key_attention_mask,
+    teacher_query_embeddings,
+    teacher_key_embeddings,
+    temperature=0.05,
+    kd_temperature=0.07,
+    kd_alpha=0.25,
+)
+```
+
+The hard component is query-to-document InfoNCE. It masks an off-diagonal
+candidate only when the student ranks it above the labeled positive by the
+configured margin and the teacher confirms it, or when teacher document
+embeddings identify duplicate contexts. The KD component retains every pair and
+matches the teacher's query-to-document and document-to-query relational
+distributions using the same temperature for student and teacher logits.
 
 ## Checkpoint conversion
 
