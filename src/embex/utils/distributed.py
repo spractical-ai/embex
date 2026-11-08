@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from typing import ContextManager, Sequence
 
 import jax
+from flax import nnx
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
 
@@ -28,6 +29,18 @@ def create_fsdp_mesh(
 def mesh_context(mesh: Mesh | None) -> ContextManager[None]:
     """Return a no-op context for one device or activate a supplied mesh."""
     return nullcontext() if mesh is None else jax.set_mesh(mesh)
+
+
+def get_model_mesh(model: nnx.Module) -> Mesh | None:
+    """Infer the common mesh of model parameters without transferring arrays."""
+    meshes = set()
+    for parameter in jax.tree.leaves(nnx.state(model, nnx.Param)):
+        sharding = getattr(parameter, "sharding", None)
+        if isinstance(sharding, NamedSharding):
+            meshes.add(sharding.mesh)
+    if len(meshes) > 1:
+        raise ValueError("Model parameters must use the same mesh.")
+    return next(iter(meshes), None)
 
 
 def shard_batch(

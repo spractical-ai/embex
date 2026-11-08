@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 
+from embex.utils.distributed import get_model_mesh, mesh_context
 from embex.utils.loss_functions import (
     infonce_kd_loss,
     infonce_loss,
@@ -53,7 +54,10 @@ def create_optimizer(
         optax.clip_by_global_norm(max_grad_norm),
         optax.adamw(learning_rate=learning_rate),
     )
-    return nnx.Optimizer(model, transform, wrt=nnx.Param)
+    # NNX copies parameter partition metadata into optimizer variables. Their
+    # creation must occur under the same mesh as the model parameters.
+    with mesh_context(get_model_mesh(model)):
+        return nnx.Optimizer(model, transform, wrt=nnx.Param)
 
 
 @nnx.jit

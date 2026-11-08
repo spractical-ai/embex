@@ -110,7 +110,8 @@ not `-100`. Use `masked_language_model_train_step` for MLM-only updates or
 MLM. These MLM APIs require XLM-RoBERTa; Qwen3-Embedding intentionally exposes
 only the contrastive path.
 
-The tutorials below intentionally remain focused on Qwen3-Embedding.
+The inference tutorial uses Qwen3-Embedding; the shared trainer below supports
+both model families and every objective in the table.
 
 ## Inference tutorial
 
@@ -197,8 +198,6 @@ model, mesh = create_qwen3_embedding(config)
 schedule = optax.warmup_cosine_decay_schedule(
     init_value=0.0, peak_value=2e-4, warmup_steps=1, decay_steps=3, end_value=0.0
 )
-trainer = EmbeddingTrainer(model, create_optimizer(model, schedule), mesh=mesh)
-
 batch = ContrastiveBatch.from_tokenizer(
     tokenizer,
     queries=[
@@ -212,14 +211,129 @@ batch = ContrastiveBatch.from_tokenizer(
     max_length=32,
 )
 
-for step in range(3):
-    print(f"step={step + 1}, loss={trainer.train_batch(batch):.4f}")
+trainer = EmbeddingTrainer(
+    model,
+    create_optimizer(model, schedule),
+    mesh=mesh,
+    objective="contrastive",
+    train_dataset=[batch] * 3,
+    num_steps=3,
+)
+history = trainer.train()
+print(history)  # [{"loss": ...}, {"loss": ...}, {"loss": ...}]
 ```
 
 `ContrastiveBatch.from_tokenizer` requires a Hugging Face tokenizer and retains
 both attention masks. `EmbeddingTrainer` places every input and mask on the
 selected mesh, then calls the model with `(input_ids, attention_mask)` for both
 the query and positive-document encoder passes.
+When `mesh` is omitted, the trainer infers it from the model's parameter
+placement. `create_optimizer` initializes optimizer state in that same mesh
+context, and the trainer activates it for each update.
+
+### One trainer for every objective
+
+Choose the objective when constructing `EmbeddingTrainer`. The same
+`trainer.train()` call handles model updates and batch placement for each
+supported combination:
+
+| `objective` | Batch type | Qwen3-Embedding | XLM-RoBERTa |
+| --- | --- | --- | --- |
+| `"contrastive"` (default) | `ContrastiveBatch` | Yes | Yes |
+| `"knowledge_distillation"` | `KnowledgeDistillationBatch` | Yes | Yes |
+| `"masked_language_modeling"` (alias `"mlm"`) | `MLMBatch` | No | Yes |
+| `"joint_contrastive_mlm"` | `JointContrastiveMLMBatch` | No | Yes |
+
+`train_dataset` is an iterable of batches, such as a list, generator, or data
+loader. With no `num_steps`, training makes one pass over that iterable. Set
+`num_steps` for infinite streams or to stop after a fixed number of updates;
+if the data ends early, the trainer raises `ValueError`. One-shot generators
+are consumed by training; supply a new iterator for another run. Data is not
+automatically repeated or shuffled. You can also supply data and a step limit
+at call time: `trainer.train(batches, num_steps=100)`.
+
+Every history entry contains a Python float `loss`. Distillation also reports
+`contrastive_loss` (its false-negative-masked hard component) and `kd_loss`;
+joint training reports `contrastive_loss` and `mlm_loss`.
+
+For distillation, wrap tokenized pairs with precomputed teacher embeddings.
+Teacher query/key rows must align with the tokenized pairs, but the teacher
+embedding width may differ from the student width:
+
+```python
+from embex import KnowledgeDistillationBatch
+
+kd_batch = KnowledgeDistillationBatch(
+    contrastive=batch,
+    teacher_query_embeddings=teacher_query_embeddings,
+    teacher_key_embeddings=teacher_key_embeddings,
+)
+trainer = EmbeddingTrainer(
+    model,
+    create_optimizer(model),
+    mesh=mesh,
+    objective="knowledge_distillation",
+    train_dataset=[kd_batch],
+    objective_kwargs={"kd_alpha": 0.25, "kd_temperature": 0.07},
+)
+history = trainer.train()
+```
+
+For MLM, use an XLM-RoBERTa model. Your data pipeline supplies already masked
+token IDs and target labels, using `-100` at positions that should not contribute
+to the loss. The trainer does not select or corrupt tokens automatically:
+
+```python
+from embex import JointContrastiveMLMBatch, MLMBatch
+from embex.models.xlm_roberta import XLMRobertaConfig, create_xlm_roberta
+
+xlmr, xlmr_mesh = create_xlm_roberta(XLMRobertaConfig.from_preset("base"))
+mlm_batch = MLMBatch(masked_input_ids, attention_mask, labels)
+trainer = EmbeddingTrainer(
+    xlmr,
+    create_optimizer(xlmr),
+    mesh=xlmr_mesh,
+    objective="masked_language_modeling",
+    train_dataset=[mlm_batch],
+)
+history = trainer.train()
+
+# Tokenize these pairs with the XLM-RoBERTa tokenizer as well.
+joint_batch = JointContrastiveMLMBatch(contrastive=xlmr_pairs, mlm=mlm_batch)
+trainer = EmbeddingTrainer(
+    xlmr,
+    create_optimizer(xlmr),
+    mesh=xlmr_mesh,
+    objective="joint_contrastive_mlm",
+    train_dataset=[joint_batch],
+    objective_kwargs={"contrastive_weight": 1.0, "mlm_weight": 0.1},
+)
+history = trainer.train()
+```
+
+Use `objective_kwargs` to override the low-level step's parameters:
+
+| Objective | Options and defaults |
+| --- | --- |
+| Contrastive | `temperature=0.05` |
+| Distillation | `temperature=0.05`, `kd_temperature=0.07`, `kd_alpha=0.25`, `false_negative_margin=0.10`, `teacher_confirmation_margin=0.05`, `duplicate_similarity_threshold=0.999999` |
+| MLM | `ignore_index=-100` |
+| Joint contrastive/MLM | `temperature=0.05`, `contrastive_weight=1.0`, `mlm_weight=1.0`, `ignore_index=-100` |
+
+The existing `temperature=` constructor argument is also supported for
+contrastive, distillation, and joint training; specify it in only one place.
+Unknown objectives, irrelevant options, invalid numerical settings, and
+incompatible models raise errors at construction. For example, choosing MLM
+with Qwen3-Embedding raises `ValueError` before any training runs. Model
+compatibility is checked through its callable interfaces, allowing future NNX
+encoders to reuse the trainer. Malformed batch shapes/dtypes are rejected by
+the batch constructors; the trainer checks objective/batch compatibility and
+mesh batch divisibility before dispatching an update.
+
+`train()` is the shared training-loop API. `train_batch(batch)` runs a single
+update and returns its total loss. To extract only total losses from a training
+run, use `[step["loss"] for step in trainer.train()]`. The low-level training
+steps remain available for custom loops.
 
 `create_qwen3_embedding` uses standard NNX initializers on one device. With
 multiple JAX devices it creates a one-axis FSDP mesh and applies the notebook's
@@ -276,3 +390,58 @@ For a complete Hugging Face-compatible directory, use
 factory. XLM-RoBERTa provides the equivalent `xlm_roberta_hf_state_dict`
 backbone factory and `xlm_roberta_mlm_hf_state_dict` masked-LM factory in
 `embex.models.xlm_roberta`.
+
+## Testing
+
+Install the development dependencies, then run the complete suite from the
+repository root:
+
+```bash
+uv sync --group dev
+uv run pytest -q
+```
+
+To run just the shared trainer checks:
+
+```bash
+uv run pytest -q tests/test_trainer.py tests/test_trainer_distributed.py
+```
+
+The tests use tiny, randomly initialized models and synthetic token arrays.
+They do not download pretrained checkpoints or datasets. Trainer/reference
+comparisons cover float32 and the default bfloat16 compute precision. Fixed
+seeds make those comparisons repeatable, including XLM-RoBERTa's dropout.
+
+| Test file | What it verifies |
+| --- | --- |
+| `tests/test_trainer.py` | All six supported model/objective combinations, objective options, returned metrics, real parameter updates, constructor and batch validation, iterator exhaustion, step limits, and compatible custom NNX encoders. |
+| `tests/test_trainer_distributed.py` | Training for all six combinations on two virtual CPU devices, inferred and explicit meshes, retained parameter sharding, and rejection of incompatible meshes and batch sizes. |
+| `tests/test_knowledge_distillation.py` | Plain InfoNCE, duplicate-context masking, the weighted KD objective, stopped teacher gradients, and finite training losses. |
+| `tests/test_masked_language_modeling.py` | Ignored labels and zero-target loss, MLM checkpoint round trips, and MLM/joint updates. |
+| `tests/test_xlm_roberta.py` | Padding-aware position IDs and pooling, token states, dropout, backbone weight round trips, and architecture presets. |
+| `tests/test_tiny_model_inference.py` | Output shape, dtype, finiteness, and repeatability for Qwen embeddings, XLM-R embeddings, and MLM logits; also reports compilation and cached-call timings. |
+| `tests/test_tiny_model_inference_8_devices.py` | Automatic mesh creation and sharded inference on eight virtual CPU devices. |
+
+For each trainer/model/objective combination, the integration test creates two
+identical models. One receives two updates through `trainer.train()`; the other
+receives the same updates through the corresponding low-level training step.
+It compares the per-step losses and final parameters, checks the optimizer
+step count, and verifies that parameters actually changed. Non-default objective
+options ensure the trainer forwards the settings correctly.
+
+Invalid-input tests check both the exception type and its message. Rejected
+batch and mesh-divisibility checks also verify that the optimizer did not
+advance before the error.
+
+The distributed tests start separate Python processes with
+`JAX_PLATFORMS=cpu` and an `XLA_FLAGS` device-count setting. JAX reads that count
+when its backend starts, so subprocess isolation keeps the forced two/eight
+device counts from affecting the rest of the suite. These checks exercise
+sharding behavior on CPU; they do not establish real GPU/TPU performance or
+retrieval quality on a held-out dataset.
+
+For the inference timing output, disable pytest's output capture:
+
+```bash
+uv run pytest -q -s tests/test_tiny_model_inference.py tests/test_tiny_model_inference_8_devices.py
+```
