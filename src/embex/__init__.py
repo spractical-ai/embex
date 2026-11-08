@@ -7,7 +7,13 @@ from embex.training import (
     knowledge_distillation_train_step,
     masked_language_model_train_step,
 )
-from embex.trainer import ContrastiveBatch, EmbeddingTrainer
+from embex.trainer import (
+    ContrastiveBatch,
+    EmbeddingTrainer,
+    JointContrastiveMLMBatch,
+    KnowledgeDistillationBatch,
+    MLMBatch,
+)
 from embex.utils.loss_functions import (
     infonce_kd_loss,
     infonce_loss,
@@ -17,6 +23,9 @@ from embex.utils.loss_functions import (
 __all__ = [
     "ContrastiveBatch",
     "EmbeddingTrainer",
+    "JointContrastiveMLMBatch",
+    "KnowledgeDistillationBatch",
+    "MLMBatch",
     "contrastive_train_step",
     "create_optimizer",
     "infonce_kd_loss",
