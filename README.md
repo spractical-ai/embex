@@ -96,7 +96,7 @@ uv sync --group dev
 | XLM-RoBERTa | Bidirectional attention with masked-mean or first-token (`cls`) pooling | InfoNCE, relational KD, MLM, or contrastive + MLM | Base, large |
 
 Both implementations expose the `(input_ids, attention_mask) -> embeddings`
-interface used by `EmbeddingTrainer`, support single-device and FSDP model
+interface used by `EmbeddingTrainer`, support single-device, FSDP, and data-parallel model
 creation, and include Hugging Face safetensors import/export adapters.
 XLM-RoBERTa also exposes `encode_tokens` for contextual states and
 `masked_language_model_logits` for token prediction through a decoder tied to
@@ -112,6 +112,37 @@ only the contrastive path.
 
 The inference tutorial uses Qwen3-Embedding; the shared trainer below supports
 both model families and every objective in the table.
+
+## Parallelism
+
+Both model factories accept `parallelism="fsdp"` (the default) or
+`parallelism="dp"`. On multiple devices, they automatically create a single-axis
+mesh over all available JAX devices:
+
+| Mode | Model parameters and optimizer moments | Batch placement | Automatic mesh axis |
+| --- | --- | --- | --- |
+| `"fsdp"` | Partitioned using the existing model sharding rules | Leading dimension sharded across all devices | `fsdp` |
+| `"dp"` | Replicated on every device | Leading dimension sharded across all devices | `dp` |
+
+```python
+# Qwen3; create_xlm_roberta(config, parallelism="dp") works the same way.
+model, mesh = create_qwen3_embedding(config, parallelism="dp")
+
+# No mode argument is needed for batch placement or the trainer.
+input_ids = shard_batch(tokens["input_ids"], mesh)
+attention_mask = shard_batch(tokens["attention_mask"], mesh)
+embeddings = model(input_ids, attention_mask)
+```
+
+On one device, either mode returns `mesh=None` and uses ordinary unpartitioned
+parameters. You can supply a one-axis `mesh` explicitly; `parallelism` still
+controls parameter placement, including when the mesh has a custom axis name.
+If supplied, `partition_axis` must match that mesh's axis.
+
+The trainer infers the mesh from the model and shards every batch input and
+mask accordingly. Each input's batch size must be divisible by the mesh device
+count. Losses operate on the global batch in both modes, preserving all in-batch
+negatives for InfoNCE and relational KD.
 
 ## Inference tutorial
 

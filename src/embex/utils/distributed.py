@@ -3,11 +3,36 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import ContextManager, Sequence
+from typing import ContextManager, Literal, Sequence
 
 import jax
 from flax import nnx
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
+
+
+Parallelism = Literal["fsdp", "dp"]
+
+
+def _validate_parallelism(parallelism: str) -> None:
+    if parallelism not in ("fsdp", "dp"):
+        raise ValueError("parallelism must be 'fsdp' or 'dp'.")
+
+
+def create_mesh(
+    devices: Sequence[jax.Device] | None = None,
+    *,
+    parallelism: Parallelism = "fsdp",
+    axis_name: str | None = None,
+) -> Mesh:
+    """Create a one-axis FSDP or data-parallel mesh over the supplied devices."""
+    _validate_parallelism(parallelism)
+    devices = tuple(jax.devices() if devices is None else devices)
+    if len(devices) < 2:
+        raise ValueError("Parallel execution requires at least two JAX devices.")
+    return jax.make_mesh(
+        (len(devices),), (axis_name or parallelism,), devices=devices,
+        axis_types=(AxisType.Auto,),
+    )
 
 
 def create_fsdp_mesh(
@@ -18,12 +43,38 @@ def create_fsdp_mesh(
     The function does not assume CPU, GPU, or TPU.  It is only called automatically
     for multi-device JAX runtimes; on one device model creation is left unpartitioned.
     """
-    devices = tuple(jax.devices() if devices is None else devices)
-    if len(devices) < 2:
-        raise ValueError("FSDP requires at least two JAX devices.")
-    return jax.make_mesh(
-        (len(devices),), (axis_name,), devices=devices, axis_types=(AxisType.Auto,)
-    )
+    return create_mesh(devices, parallelism="fsdp", axis_name=axis_name)
+
+
+def _resolve_model_mesh(
+    mesh: Mesh | None, partition_axis: str | None, parallelism: Parallelism
+) -> tuple[Mesh | None, str | None]:
+    """Resolve the common factory placement contract for both model families."""
+    _validate_parallelism(parallelism)
+    if mesh is None and jax.device_count() > 1:
+        mesh = create_mesh(parallelism=parallelism)
+    if mesh is None:
+        return None, None
+    if not isinstance(mesh, Mesh):
+        raise TypeError("mesh must be a JAX Mesh or None.")
+    if len(mesh.axis_names) != 1:
+        raise ValueError("Model creation requires a one-axis mesh.")
+    axis = str(mesh.axis_names[0])
+    if partition_axis is not None and partition_axis != axis:
+        raise ValueError("partition_axis must match the mesh axis.")
+    return mesh, axis
+
+
+def _replicate_parameters(model: nnx.Module, mesh: Mesh) -> None:
+    """Replicate every parameter and retain this layout in NNX optimizer metadata."""
+    sharding = NamedSharding(mesh, PartitionSpec())
+    state = nnx.state(model, nnx.Param)
+    for variable in jax.tree.leaves(
+        state, is_leaf=lambda value: isinstance(value, nnx.Variable)
+    ):
+        variable.set_metadata(out_sharding=(None,) * variable.ndim)
+        variable.set_value(jax.device_put(variable.get_value(), sharding))
+    nnx.update(model, state)
 
 
 def mesh_context(mesh: Mesh | None) -> ContextManager[None]:
