@@ -10,7 +10,13 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh
 
-from embex.utils.distributed import create_fsdp_mesh, mesh_context
+from embex.utils.distributed import (
+    Parallelism,
+    _replicate_parameters,
+    _resolve_model_mesh,
+    _validate_parallelism,
+    mesh_context,
+)
 
 
 @dataclass
@@ -289,7 +295,10 @@ class Qwen3Embedding(nnx.Module):
         config: Qwen3EmbeddingConfig,
         rngs: nnx.Rngs,
         partition_axis: str | None = None,
+        *,
+        parallelism: Parallelism = "fsdp",
     ) -> None:
+        _validate_parallelism(parallelism)
         if jax.device_count() > 1 and partition_axis is None:
             raise ValueError(
                 "Multi-device construction requires an active mesh and a partition axis. "
@@ -297,19 +306,23 @@ class Qwen3Embedding(nnx.Module):
                 "and pass that mesh axis as partition_axis."
             )
         self.config = config
+        self.parallelism = parallelism
+        weight_axis = partition_axis if parallelism == "fsdp" else None
         self.embed_tokens = nnx.Embed(
             config.vocab_size,
             config.hidden_size,
             param_dtype=config.param_dtype,
             dtype=config.dtype,
-            embedding_init=_kernel_init(partition_axis, (None, "fsdp")),
+            embedding_init=_kernel_init(weight_axis, (None, "fsdp")),
             rngs=rngs,
         )
         self.layers = nnx.List(
-            QwenBlock(config, rngs, partition_axis)
+            QwenBlock(config, rngs, weight_axis)
             for _ in range(config.num_hidden_layers)
         )
         self.norm = nnx.RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
+        if parallelism == "dp" and partition_axis is not None:
+            _replicate_parameters(self, jax.sharding.get_mesh())
 
     def __call__(
         self, input_ids: jax.Array, attention_mask: jax.Array | None = None
@@ -345,24 +358,22 @@ def create_qwen3_embedding(
     seed: int = 0,
     mesh: Mesh | None = None,
     partition_axis: str | None = None,
+    parallelism: Parallelism = "fsdp",
 ) -> tuple[Qwen3Embedding, Mesh | None]:
-    """Create a model, using one-axis FSDP only when multiple devices are available.
+    """Create a model with FSDP (default) or replicated data parallelism.
 
     Pass a mesh to control placement explicitly.  When no mesh is given, EmbeX creates
-    a single-axis FSDP mesh for multi-device JAX runtimes and uses ordinary initializers
-    for a single device.
+    a single-axis mesh named after ``parallelism`` for multi-device JAX runtimes.
+    FSDP shards parameters; DP replicates them. Both shard the leading batch axis.
+    A single device uses ordinary, unpartitioned initialization.
     """
-    if mesh is None and jax.device_count() > 1:
-        mesh = create_fsdp_mesh()
-    if mesh is not None and partition_axis is None:
-        partition_axis = str(mesh.axis_names[0])
-    if mesh is None:
-        partition_axis = None
+    mesh, partition_axis = _resolve_model_mesh(mesh, partition_axis, parallelism)
 
     with mesh_context(mesh):
         model = Qwen3Embedding(
             config,
             rngs=nnx.Rngs(params=seed),
             partition_axis=partition_axis,
+            parallelism=parallelism,
         )
     return model, mesh

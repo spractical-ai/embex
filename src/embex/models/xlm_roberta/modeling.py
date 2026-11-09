@@ -10,7 +10,13 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh
 
-from embex.utils.distributed import create_fsdp_mesh, mesh_context
+from embex.utils.distributed import (
+    Parallelism,
+    _replicate_parameters,
+    _resolve_model_mesh,
+    _validate_parallelism,
+    mesh_context,
+)
 
 
 @dataclass
@@ -325,7 +331,10 @@ class XLMRobertaEmbedding(nnx.Module):
         config: XLMRobertaConfig,
         rngs: nnx.Rngs,
         partition_axis: str | None = None,
+        *,
+        parallelism: Parallelism = "fsdp",
     ) -> None:
+        _validate_parallelism(parallelism)
         if jax.device_count() > 1 and partition_axis is None:
             raise ValueError(
                 "Multi-device construction requires an active mesh and a "
@@ -334,12 +343,16 @@ class XLMRobertaEmbedding(nnx.Module):
                 "and pass that mesh axis as partition_axis."
             )
         self.config = config
-        self.embeddings = XLMRobertaEmbeddings(config, rngs, partition_axis)
+        self.parallelism = parallelism
+        weight_axis = partition_axis if parallelism == "fsdp" else None
+        self.embeddings = XLMRobertaEmbeddings(config, rngs, weight_axis)
         self.layers = nnx.List(
-            XLMRobertaBlock(config, rngs, partition_axis)
+            XLMRobertaBlock(config, rngs, weight_axis)
             for _ in range(config.num_hidden_layers)
         )
-        self.lm_head = XLMRobertaMLMHead(config, rngs, partition_axis)
+        self.lm_head = XLMRobertaMLMHead(config, rngs, weight_axis)
+        if parallelism == "dp" and partition_axis is not None:
+            _replicate_parameters(self, jax.sharding.get_mesh())
 
     def encode_tokens(
         self,
@@ -411,19 +424,21 @@ def create_xlm_roberta(
     seed: int = 0,
     mesh: Mesh | None = None,
     partition_axis: str | None = None,
+    parallelism: Parallelism = "fsdp",
 ) -> tuple[XLMRobertaEmbedding, Mesh | None]:
-    """Create XLM-RoBERTa with optional one-axis FSDP placement."""
-    if mesh is None and jax.device_count() > 1:
-        mesh = create_fsdp_mesh()
-    if mesh is not None and partition_axis is None:
-        partition_axis = str(mesh.axis_names[0])
-    if mesh is None:
-        partition_axis = None
+    """Create XLM-R with FSDP (default) or replicated data parallelism.
+
+    Multi-device runtimes automatically use a one-axis mesh named after the mode.
+    Both modes shard batches; only FSDP shards parameters. Single-device runtimes
+    use ordinary, unpartitioned initialization unless a mesh is supplied.
+    """
+    mesh, partition_axis = _resolve_model_mesh(mesh, partition_axis, parallelism)
 
     with mesh_context(mesh):
         model = XLMRobertaEmbedding(
             config,
             rngs=nnx.Rngs(params=seed, dropout=seed + 1),
             partition_axis=partition_axis,
+            parallelism=parallelism,
         )
     return model, mesh
